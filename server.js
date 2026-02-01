@@ -1,27 +1,21 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 app.use(cors());
 app.use(express.json({ limit: '50mb' })); // Increased payload limit to 50MB
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
-
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
-
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'meta/llama-3.1-8b-instruct',
   'gpt-4': 'deepseek-ai/deepseek-v3.2',
   'gpt-4-turbo': 'meta/llama-3.1-405b-instruct'
 };
-
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'OpenAI to NVIDIA NIM Proxy' });
 });
-
 app.get('/v1/models', (req, res) => {
   const models = Object.keys(MODEL_MAPPING).map(model => ({
     id: model,
@@ -35,7 +29,6 @@ app.get('/v1/models', (req, res) => {
     data: models
   });
 });
-
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
@@ -46,19 +39,40 @@ app.post('/v1/chat/completions', async (req, res) => {
       model: nimModel,
       messages: messages,
       temperature: temperature || 0.7,
-      max_tokens: max_tokens || 16384, // Increased from 9024 to 16384 for longer responses,
-      stop: null, // Don't stop generation prematurely
+      max_tokens: max_tokens || 16384,
+      stop: null,
       stream: stream || false
     };
     
-    const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
-      headers: {
-        'Authorization': `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      responseType: stream ? 'stream' : 'json',
-      timeout: 120000  // 120 seconds timeout (increased from default 30s)
-    });
+    // INFINITE RETRY LOGIC - Keeps trying until successful
+    let response;
+    let attempt = 0;
+    
+    while (!response) {
+      attempt++;
+      try {
+        console.log(`Attempt ${attempt} for model ${nimModel}...`);
+        
+        response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
+          headers: {
+            'Authorization': `Bearer ${NIM_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          responseType: stream ? 'stream' : 'json',
+          timeout: 120000
+        });
+        
+        console.log(`✓ Success on attempt ${attempt}!`);
+        
+      } catch (error) {
+        if (error.code === 'ECONNABORTED' || error.response?.status === 504 || error.response?.status === 503) {
+          console.log(`Attempt ${attempt} timed out. Retrying in 5 seconds...`);
+          await new Promise(resolve => setTimeout(resolve, 5000));
+        } else {
+          throw error;
+        }
+      }
+    }
     
     if (stream) {
       res.setHeader('Content-Type', 'text/plain');
@@ -98,7 +112,6 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
   }
 });
-
 app.all('*', (req, res) => {
   res.status(404).json({
     error: {
@@ -108,7 +121,6 @@ app.all('*', (req, res) => {
     }
   });
 });
-
 app.listen(PORT, () => {
   console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
