@@ -59,7 +59,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             'Content-Type': 'application/json'
           },
           responseType: 'json',
-          timeout: 120000
+          timeout: 30000
         });
         
         console.log(`✓ Success on attempt ${attempt}!`);
