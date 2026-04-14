@@ -92,7 +92,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       };
       
       res.json(openaiResponse);
-    }
     
   } catch (error) {
     console.error('Proxy error:', error.message);
