@@ -41,7 +41,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       temperature: temperature || 0.7,
       max_tokens: max_tokens || 16384,
       stop: null,
-      stream: stream || false
+      stream: false
     };
     
     // INFINITE RETRY LOGIC - Keeps trying until successful
@@ -58,7 +58,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             'Authorization': `Bearer ${NIM_API_KEY}`,
             'Content-Type': 'application/json'
           },
-          responseType: stream ? 'stream' : 'json',
+          responseType: 'json',
           timeout: 120000
         });
         
@@ -74,12 +74,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     }
     
-    if (stream) {
-      res.setHeader('Content-Type', 'text/plain');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      response.data.pipe(res);
-    } else {
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
