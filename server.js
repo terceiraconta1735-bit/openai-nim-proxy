@@ -38,6 +38,9 @@ app.get('/v1/models', (req, res) => {
 
 app.post('/v1/chat/completions', async (req, res) => {
 
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Transfer-Encoding", "chunked");
+  
   // ✅ FIX 1: prevent early browser timeout issues
   res.setTimeout(120000);
   req.setTimeout(120000);
@@ -123,7 +126,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     // ✅ FIX 3: safe response headers + explicit send
     res.setHeader("Content-Type", "application/json");
-    res.status(200).json(openaiResponse);
+    res.write(JSON.stringify(openaiResponse));
+    res.end();
 
   } catch (error) {
     console.error('Proxy error:', error.message);
