@@ -13,9 +13,9 @@ const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.c
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
 const MODEL_MAPPING = {
-  'gpt-3.5-turbo': 'meta/llama-3.1-8b-instruct',
+  'gpt-3.5-turbo': 'deepseek-ai/deepseek-v3.2',
   'gpt-4': 'deepseek-ai/deepseek-v3.2',
-  'gpt-4-turbo': 'meta/llama-3.1-405b-instruct'
+  'gpt-4-turbo': 'deepseek-ai/deepseek-v3.2'
 };
 
 app.get('/health', (req, res) => {
@@ -37,39 +37,29 @@ app.get('/v1/models', (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
-
-  res.setHeader("Content-Type", "application/json");
-  res.setHeader("Transfer-Encoding", "chunked");
-  
-  // ✅ FIX 1: prevent early browser timeout issues
-  res.setTimeout(120000);
-  req.setTimeout(120000);
-
-  console.log("Request received");
-
   try {
-    const { model, messages, temperature, max_tokens } = req.body;
+    const { model, messages, temperature, max_tokens, stream } = req.body;
 
-    const nimModel =
-      MODEL_MAPPING[model] || MODEL_MAPPING['gpt-3.5-turbo'];
+    const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v3.2';
 
     const nimRequest = {
       model: nimModel,
-      messages,
+      messages: messages,
       temperature: temperature || 0.7,
       max_tokens: max_tokens || 16384,
       stop: null,
-      stream: false
+      stream: stream || false
     };
 
     let response;
     let attempt = 0;
+    const maxAttempts = 15;
 
-    while (!response) {
+    while (!response && attempt < maxAttempts) {
       attempt++;
 
       try {
-        console.log(`Attempt ${attempt} for model ${nimModel}...`);
+        console.log(`Attempt ${attempt}/${maxAttempts} for ${nimModel}`);
 
         response = await axios.post(
           `${NIM_API_BASE}/chat/completions`,
@@ -79,29 +69,42 @@ app.post('/v1/chat/completions', async (req, res) => {
               'Authorization': `Bearer ${NIM_API_KEY}`,
               'Content-Type': 'application/json'
             },
-
-            // ✅ FIX 2: shorter timeout to avoid hanging connections
-            timeout: 120000,
-            responseType: 'json'
+            timeout: 90000,
+            responseType: stream ? 'stream' : 'json'
           }
         );
 
-        console.log(`✓ Success on attempt ${attempt}!`);
+        console.log(`Success on attempt ${attempt}`);
 
       } catch (error) {
-        console.log(`Attempt ${attempt} failed:`, error.code || error.message);
+        console.log(`Attempt ${attempt} failed: ${error.code || error.response?.status}`);
 
-        // retry only on temporary failures
         if (
           error.code === 'ECONNABORTED' ||
           error.response?.status === 503 ||
           error.response?.status === 504
         ) {
-          await new Promise(r => setTimeout(r, 2000));
+          if (attempt < maxAttempts) {
+            await new Promise(r => setTimeout(r, 4000));
+          }
+        } else if (error.response?.status === 429) {
+          await new Promise(r => setTimeout(r, 25000));
         } else {
           throw error;
         }
       }
+    }
+
+    if (!response) {
+      throw new Error('DeepSeek timeout after all attempts');
+    }
+
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      response.data.pipe(res);
+      return;
     }
 
     const openaiResponse = {
@@ -109,13 +112,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model: model,
-      choices: (response.data.choices || []).map((choice, i) => ({
-        index: i,
-        message: choice.message || {
-          role: "assistant",
-          content: choice.text || ""
-        },
-        finish_reason: choice.finish_reason || "stop"
+      choices: response.data.choices.map(choice => ({
+        index: choice.index,
+        message: choice.message,
+        finish_reason: choice.finish_reason
       })),
       usage: response.data.usage || {
         prompt_tokens: 0,
@@ -124,21 +124,20 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     };
 
-    // ✅ FIX 3: safe response headers + explicit send
-    res.setHeader("Content-Type", "application/json");
-    res.write(JSON.stringify(openaiResponse));
-    res.end();
+    res.json(openaiResponse);
 
   } catch (error) {
     console.error('Proxy error:', error.message);
 
-    res.status(error.response?.status || 500).json({
-      error: {
-        message: error.message || 'Internal server error',
-        type: 'invalid_request_error',
-        code: error.response?.status || 500
-      }
-    });
+    if (!res.headersSent) {
+      res.status(error.response?.status || 500).json({
+        error: {
+          message: error.message || 'Internal server error',
+          type: 'invalid_request_error',
+          code: error.response?.status || 500
+        }
+      });
+    }
   }
 });
 
