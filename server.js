@@ -38,7 +38,9 @@ app.get('/v1/models', (req, res) => {
 
 app.post('/v1/chat/completions', async (req, res) => {
   try {
-    const { model, messages, temperature, max_tokens, stream } = req.body;
+    const { model, messages, temperature, max_tokens } = req.body;
+
+    const stream = true; // 🔥 FORCE STREAMING
 
     const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v3.2';
 
@@ -48,7 +50,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       temperature: temperature || 0.7,
       max_tokens: max_tokens || 16384,
       stop: null,
-      stream: stream || false
+      stream: true
     };
 
     let response;
@@ -70,7 +72,7 @@ app.post('/v1/chat/completions', async (req, res) => {
               'Content-Type': 'application/json'
             },
             timeout: 90000,
-            responseType: stream ? 'stream' : 'json'
+            responseType: 'stream' // 🔥 ALWAYS STREAM
           }
         );
 
@@ -99,32 +101,25 @@ app.post('/v1/chat/completions', async (req, res) => {
       throw new Error('DeepSeek timeout after all attempts');
     }
 
-    if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      response.data.pipe(res);
-      return;
-    }
+    // 🔥 STREAMING RESPONSE TO CLIENT
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
 
-    const openaiResponse = {
-      id: `chatcmpl-${Date.now()}`,
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model: model,
-      choices: response.data.choices.map(choice => ({
-        index: choice.index,
-        message: choice.message,
-        finish_reason: choice.finish_reason
-      })),
-      usage: response.data.usage || {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0
-      }
-    };
+    res.flushHeaders(); // VERY IMPORTANT
 
-    res.json(openaiResponse);
+    response.data.on('data', (chunk) => {
+      res.write(chunk); // pass data immediately
+    });
+
+    response.data.on('end', () => {
+      res.end();
+    });
+
+    response.data.on('error', (err) => {
+      console.error('Stream error:', err);
+      res.end();
+    });
 
   } catch (error) {
     console.error('Proxy error:', error.message);
