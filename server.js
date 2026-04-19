@@ -37,10 +37,20 @@ app.get('/v1/models', (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
+
+  // 🔥 START STREAM IMMEDIATELY (CRITICAL FIX)
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  // 🔥 KEEP CONNECTION ALIVE DURING RETRIES
+  const keepAlive = setInterval(() => {
+    res.write(': keep-alive\n\n');
+  }, 5000);
+
   try {
     const { model, messages, temperature, max_tokens } = req.body;
-
-    const stream = true; // 🔥 FORCE STREAMING
 
     const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v3.2';
 
@@ -72,7 +82,7 @@ app.post('/v1/chat/completions', async (req, res) => {
               'Content-Type': 'application/json'
             },
             timeout: 90000,
-            responseType: 'stream' // 🔥 ALWAYS STREAM
+            responseType: 'stream'
           }
         );
 
@@ -92,24 +102,23 @@ app.post('/v1/chat/completions', async (req, res) => {
         } else if (error.response?.status === 429) {
           await new Promise(r => setTimeout(r, 25000));
         } else {
+          clearInterval(keepAlive);
           throw error;
         }
       }
     }
 
     if (!response) {
+      clearInterval(keepAlive);
       throw new Error('DeepSeek timeout after all attempts');
     }
 
-    // 🔥 STREAMING RESPONSE TO CLIENT
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
+    // 🔥 STOP KEEP-ALIVE ON SUCCESS
+    clearInterval(keepAlive);
 
-    res.flushHeaders(); // VERY IMPORTANT
-
+    // 🔥 STREAM REAL DATA
     response.data.on('data', (chunk) => {
-      res.write(chunk); // pass data immediately
+      res.write(chunk);
     });
 
     response.data.on('end', () => {
@@ -124,6 +133,8 @@ app.post('/v1/chat/completions', async (req, res) => {
   } catch (error) {
     console.error('Proxy error:', error.message);
 
+    clearInterval(keepAlive);
+
     if (!res.headersSent) {
       res.status(error.response?.status || 500).json({
         error: {
@@ -132,6 +143,8 @@ app.post('/v1/chat/completions', async (req, res) => {
           code: error.response?.status || 500
         }
       });
+    } else {
+      res.end();
     }
   }
 });
