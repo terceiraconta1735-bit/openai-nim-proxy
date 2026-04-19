@@ -38,15 +38,15 @@ app.get('/v1/models', (req, res) => {
 
 app.post('/v1/chat/completions', async (req, res) => {
 
-  // 🔥 START STREAM IMMEDIATELY (CRITICAL FIX)
+  // 🔥 START SSE IMMEDIATELY
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  // 🔥 KEEP CONNECTION ALIVE DURING RETRIES
+  // 🔥 VALID OPENAI KEEP-ALIVE (IMPORTANT FIX)
   const keepAlive = setInterval(() => {
-    res.write(': keep-alive\n\n');
+    res.write(`data: {"choices":[{"delta":{}}]}\n\n`);
   }, 5000);
 
   try {
@@ -116,12 +116,14 @@ app.post('/v1/chat/completions', async (req, res) => {
     // 🔥 STOP KEEP-ALIVE ON SUCCESS
     clearInterval(keepAlive);
 
-    // 🔥 STREAM REAL DATA
+    // 🔥 STREAM NVIDIA RESPONSE
     response.data.on('data', (chunk) => {
       res.write(chunk);
     });
 
     response.data.on('end', () => {
+      // 🔥 REQUIRED FOR OPENAI CLIENTS
+      res.write('data: [DONE]\n\n');
       res.end();
     });
 
