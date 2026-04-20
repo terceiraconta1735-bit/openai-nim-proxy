@@ -1,54 +1,4 @@
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
-
-const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
-const NIM_API_KEY = process.env.NIM_API_KEY;
-
-const MODEL_MAPPING = {
-  'gpt-3.5-turbo': 'deepseek-ai/deepseek-v3.2',
-  'gpt-4': 'deepseek-ai/deepseek-v3.2',
-  'gpt-4-turbo': 'deepseek-ai/deepseek-v3.2'
-};
-
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'OpenAI to NVIDIA NIM Proxy' });
-});
-
-app.get('/v1/models', (req, res) => {
-  const models = Object.keys(MODEL_MAPPING).map(model => ({
-    id: model,
-    object: 'model',
-    created: Date.now(),
-    owned_by: 'nvidia-nim-proxy'
-  }));
-
-  res.json({
-    object: 'list',
-    data: models
-  });
-});
-
 app.post('/v1/chat/completions', async (req, res) => {
-
-  // 🔥 START SSE IMMEDIATELY
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
-
-  // 🔥 VALID OPENAI KEEP-ALIVE (IMPORTANT FIX)
-  const keepAlive = setInterval(() => {
-    res.write(`data: {"choices":[{"delta":{}}]}\n\n`);
-  }, 5000);
-
   try {
     const { model, messages, temperature, max_tokens } = req.body;
 
@@ -56,22 +6,35 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     const nimRequest = {
       model: nimModel,
-      messages: messages,
+      messages,
       temperature: temperature || 0.7,
       max_tokens: max_tokens || 16384,
-      stop: null,
       stream: true
     };
 
-    let response;
+    // 🔥 STEP 1: OPEN STREAM IMMEDIATELY (CRITICAL)
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    // 🔥 STEP 2: SEND INITIAL KEEP-ALIVE (VERY IMPORTANT)
+    res.write(`data: {"choices":[{"delta":{"content":""}}]}\n\n`);
+
     let attempt = 0;
     const maxAttempts = 15;
+    let response;
+
+    // 🔥 STEP 3: KEEP CONNECTION ALIVE WHILE WAITING
+    const keepAlive = setInterval(() => {
+      res.write(`:\n\n`); // SSE comment ping
+    }, 15000);
 
     while (!response && attempt < maxAttempts) {
       attempt++;
 
       try {
-        console.log(`Attempt ${attempt}/${maxAttempts} for ${nimModel}`);
+        console.log(`Attempt ${attempt}/${maxAttempts}`);
 
         response = await axios.post(
           `${NIM_API_BASE}/chat/completions`,
@@ -96,72 +59,49 @@ app.post('/v1/chat/completions', async (req, res) => {
           error.response?.status === 503 ||
           error.response?.status === 504
         ) {
-          if (attempt < maxAttempts) {
-            await new Promise(r => setTimeout(r, 4000));
-          }
+          await new Promise(r => setTimeout(r, 4000));
         } else if (error.response?.status === 429) {
           await new Promise(r => setTimeout(r, 25000));
         } else {
           clearInterval(keepAlive);
-          throw error;
+          res.write(`data: {"error":"Upstream error"}\n\n`);
+          res.end();
+          return;
         }
       }
     }
 
     if (!response) {
       clearInterval(keepAlive);
-      throw new Error('DeepSeek timeout after all attempts');
+      res.write(`data: {"error":"Timeout"}\n\n`);
+      res.end();
+      return;
     }
 
-    // 🔥 STOP KEEP-ALIVE ON SUCCESS
-    clearInterval(keepAlive);
-
-    // 🔥 STREAM NVIDIA RESPONSE
+    // 🔥 STEP 4: PIPE REAL STREAM
     response.data.on('data', (chunk) => {
       res.write(chunk);
     });
 
     response.data.on('end', () => {
-      // 🔥 REQUIRED FOR OPENAI CLIENTS
-      res.write('data: [DONE]\n\n');
+      clearInterval(keepAlive);
       res.end();
     });
 
-    response.data.on('error', (err) => {
-      console.error('Stream error:', err);
+    response.data.on('error', () => {
+      clearInterval(keepAlive);
       res.end();
     });
 
   } catch (error) {
     console.error('Proxy error:', error.message);
 
-    clearInterval(keepAlive);
-
     if (!res.headersSent) {
-      res.status(error.response?.status || 500).json({
+      res.status(500).json({
         error: {
-          message: error.message || 'Internal server error',
-          type: 'invalid_request_error',
-          code: error.response?.status || 500
+          message: error.message
         }
       });
-    } else {
-      res.end();
     }
   }
-});
-
-app.all('*', (req, res) => {
-  res.status(404).json({
-    error: {
-      message: `Endpoint ${req.path} not found`,
-      type: 'invalid_request_error',
-      code: 404
-    }
-  });
-});
-
-app.listen(PORT, () => {
-  console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
 });
