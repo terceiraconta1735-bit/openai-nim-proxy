@@ -14,7 +14,7 @@ const NIM_API_KEY = process.env.NIM_API_KEY;
 
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'deepseek-ai/deepseek-v3.2',
-  'gpt-4': 'deepseek-ai/deepseek-v3.2',
+  'gpt-4': 'deepseek-ai/deepseek-v3.1',
   'gpt-4-turbo': 'deepseek-ai/deepseek-v3.2'
 };
 
