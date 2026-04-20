@@ -12,10 +12,11 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
+// ✅ FORCE ONLY V3.1
 const MODEL_MAPPING = {
-  'gpt-3.5-turbo': 'deepseek-ai/deepseek-v3.2',
+  'gpt-3.5-turbo': 'deepseek-ai/deepseek-v3.1',
   'gpt-4': 'deepseek-ai/deepseek-v3.1',
-  'gpt-4-turbo': 'deepseek-ai/deepseek-v3.2'
+  'gpt-4-turbo': 'deepseek-ai/deepseek-v3.1'
 };
 
 app.get('/health', (req, res) => {
@@ -37,13 +38,11 @@ app.get('/v1/models', (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
-  const startTime = Date.now();
-  const RENDER_TIMEOUT = 13 * 60 * 1000; // 13 minutos (margem de seguranca)
-
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
 
-    const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v3.2';
+    // ✅ NO FALLBACK TO V3.2 EVER
+    const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v3.1';
 
     const nimRequest = {
       model: nimModel,
@@ -55,18 +54,13 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     let response;
     let attempt = 0;
+    const maxAttempts = 5; // ✅ sane retry
 
-    while (!response) {
-      // Checa se ja passou 13 minutos
-      if (Date.now() - startTime > RENDER_TIMEOUT) {
-        console.log('Render timeout approaching - stopping attempts');
-        throw new Error('Request timeout - DeepSeek unavailable');
-      }
-
+    while (!response && attempt < maxAttempts) {
       attempt++;
 
       try {
-        console.log(`Attempt ${attempt} for ${nimModel}`);
+        console.log(`Attempt ${attempt}/${maxAttempts} for ${nimModel}`);
 
         response = await axios.post(
           `${NIM_API_BASE}/chat/completions`,
@@ -76,7 +70,7 @@ app.post('/v1/chat/completions', async (req, res) => {
               'Authorization': `Bearer ${NIM_API_KEY}`,
               'Content-Type': 'application/json'
             },
-            timeout: 45000, // 45 segundos por tentativa
+            timeout: 45000,
             responseType: stream ? 'stream' : 'json'
           }
         );
@@ -86,33 +80,41 @@ app.post('/v1/chat/completions', async (req, res) => {
       } catch (error) {
         console.log(`Attempt ${attempt} failed: ${error.code || error.response?.status}`);
 
-        // Checa timeout do Render antes de retentar
-        if (Date.now() - startTime > RENDER_TIMEOUT) {
-          throw new Error('Request timeout - DeepSeek unavailable');
-        }
-
         if (
           error.code === 'ECONNABORTED' ||
           error.response?.status === 503 ||
           error.response?.status === 504
         ) {
-          await new Promise(r => setTimeout(r, 2000)); // Espera 2s
+          await new Promise(r => setTimeout(r, 2000));
         } else if (error.response?.status === 429) {
-          await new Promise(r => setTimeout(r, 15000)); // Espera 15s
+          await new Promise(r => setTimeout(r, 10000));
         } else {
           throw error;
         }
       }
     }
 
+    if (!response) {
+      throw new Error('Model did not respond after retries');
+    }
+
+    // ✅ STREAMING
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-      response.data.pipe(res);
+
+      response.data.on('data', chunk => res.write(chunk));
+      response.data.on('end', () => res.end());
+      response.data.on('error', err => {
+        console.error('Stream error:', err);
+        res.end();
+      });
+
       return;
     }
 
+    // ✅ NORMAL RESPONSE
     const openaiResponse = {
       id: `chatcmpl-${Date.now()}`,
       object: 'chat.completion',
@@ -136,11 +138,11 @@ app.post('/v1/chat/completions', async (req, res) => {
     console.error('Proxy error:', error.message);
 
     if (!res.headersSent) {
-      res.status(error.response?.status || 503).json({
+      res.status(error.response?.status || 500).json({
         error: {
-          message: 'DeepSeek 3.2 is currently overloaded. Please try again in a few minutes.',
-          type: 'service_unavailable',
-          code: 503
+          message: error.response?.data?.error?.message || error.message,
+          type: 'proxy_error',
+          code: error.response?.status || 500
         }
       });
     }
@@ -159,5 +161,4 @@ app.all('*', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Proxy running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
 });
