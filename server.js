@@ -37,6 +37,9 @@ app.get('/v1/models', (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
+  const startTime = Date.now();
+  const RENDER_TIMEOUT = 13 * 60 * 1000; // 13 minutos (margem de seguranca)
+
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
 
@@ -52,13 +55,18 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     let response;
     let attempt = 0;
-    const maxAttempts = 15;
 
-    while (!response && attempt < maxAttempts) {
+    while (!response) {
+      // Checa se ja passou 13 minutos
+      if (Date.now() - startTime > RENDER_TIMEOUT) {
+        console.log('Render timeout approaching - stopping attempts');
+        throw new Error('Request timeout - DeepSeek unavailable');
+      }
+
       attempt++;
 
       try {
-        console.log(`Attempt ${attempt}/${maxAttempts} for ${nimModel}`);
+        console.log(`Attempt ${attempt} for ${nimModel}`);
 
         response = await axios.post(
           `${NIM_API_BASE}/chat/completions`,
@@ -68,7 +76,7 @@ app.post('/v1/chat/completions', async (req, res) => {
               'Authorization': `Bearer ${NIM_API_KEY}`,
               'Content-Type': 'application/json'
             },
-            timeout: 90000,
+            timeout: 45000, // 45 segundos por tentativa
             responseType: stream ? 'stream' : 'json'
           }
         );
@@ -78,24 +86,23 @@ app.post('/v1/chat/completions', async (req, res) => {
       } catch (error) {
         console.log(`Attempt ${attempt} failed: ${error.code || error.response?.status}`);
 
+        // Checa timeout do Render antes de retentar
+        if (Date.now() - startTime > RENDER_TIMEOUT) {
+          throw new Error('Request timeout - DeepSeek unavailable');
+        }
+
         if (
           error.code === 'ECONNABORTED' ||
           error.response?.status === 503 ||
           error.response?.status === 504
         ) {
-          if (attempt < maxAttempts) {
-            await new Promise(r => setTimeout(r, 4000));
-          }
+          await new Promise(r => setTimeout(r, 2000)); // Espera 2s
         } else if (error.response?.status === 429) {
-          await new Promise(r => setTimeout(r, 25000));
+          await new Promise(r => setTimeout(r, 15000)); // Espera 15s
         } else {
           throw error;
         }
       }
-    }
-
-    if (!response) {
-      throw new Error('DeepSeek timeout after all attempts');
     }
 
     if (stream) {
@@ -129,11 +136,11 @@ app.post('/v1/chat/completions', async (req, res) => {
     console.error('Proxy error:', error.message);
 
     if (!res.headersSent) {
-      res.status(error.response?.status || 500).json({
+      res.status(error.response?.status || 503).json({
         error: {
-          message: error.message || 'Internal server error',
-          type: 'invalid_request_error',
-          code: error.response?.status || 500
+          message: 'DeepSeek 3.2 is currently overloaded. Please try again in a few minutes.',
+          type: 'service_unavailable',
+          code: 503
         }
       });
     }
