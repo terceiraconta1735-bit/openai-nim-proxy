@@ -15,7 +15,7 @@ const NIM_API_KEY = process.env.NIM_API_KEY;
 // ✅ FORCE ONLY V3.1
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'deepseek-ai/deepseek-v3.1',
-  'gpt-4': 'deepseek-ai/deepseek-v3.1',
+  'gpt-4': 'deepseek-ai/deepseek-v3.1-terminus',
   'gpt-4-turbo': 'deepseek-ai/deepseek-v3.1'
 };
 
@@ -42,7 +42,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     const { model, messages, temperature, max_tokens, stream } = req.body;
 
     // ✅ NO FALLBACK TO V3.2 EVER
-    const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v3.1';
+    const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v3.1-terminus';
 
     const nimRequest = {
       model: nimModel,
