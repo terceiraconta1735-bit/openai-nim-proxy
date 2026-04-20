@@ -5,28 +5,23 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// ENV
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// Model mapping
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'deepseek-ai/deepseek-v3.2',
   'gpt-4': 'deepseek-ai/deepseek-v3.2',
   'gpt-4-turbo': 'deepseek-ai/deepseek-v3.2'
 };
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'OpenAI to NVIDIA NIM Proxy' });
 });
 
-// Models endpoint
 app.get('/v1/models', (req, res) => {
   const models = Object.keys(MODEL_MAPPING).map(model => ({
     id: model,
@@ -41,38 +36,23 @@ app.get('/v1/models', (req, res) => {
   });
 });
 
-// 🔥 MAIN ROUTE (FIXED STREAMING + RETRY)
 app.post('/v1/chat/completions', async (req, res) => {
   try {
-    const { model, messages, temperature, max_tokens } = req.body;
+    const { model, messages, temperature, max_tokens, stream } = req.body;
 
     const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v3.2';
 
     const nimRequest = {
       model: nimModel,
-      messages,
+      messages: messages,
       temperature: temperature || 0.7,
       max_tokens: max_tokens || 16384,
-      stream: true
+      stream: stream || false
     };
 
-    // ✅ OPEN CONNECTION IMMEDIATELY
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders();
-
-    // ✅ INITIAL HANDSHAKE (prevents Cloudflare kill)
-    res.write(`data: {"choices":[{"delta":{"content":""}}]}\n\n`);
-
-    // ✅ KEEP CONNECTION ALIVE
-    const keepAlive = setInterval(() => {
-      res.write(`:\n\n`);
-    }, 15000);
-
+    let response;
     let attempt = 0;
     const maxAttempts = 15;
-    let response;
 
     while (!response && attempt < maxAttempts) {
       attempt++;
@@ -89,69 +69,77 @@ app.post('/v1/chat/completions', async (req, res) => {
               'Content-Type': 'application/json'
             },
             timeout: 90000,
-            responseType: 'stream'
+            responseType: stream ? 'stream' : 'json'
           }
         );
 
-        console.log(`✅ Success on attempt ${attempt}`);
+        console.log(`Success on attempt ${attempt}`);
 
       } catch (error) {
-        console.log(`❌ Attempt ${attempt} failed: ${error.code || error.response?.status}`);
+        console.log(`Attempt ${attempt} failed: ${error.code || error.response?.status}`);
 
         if (
           error.code === 'ECONNABORTED' ||
           error.response?.status === 503 ||
           error.response?.status === 504
         ) {
-          await new Promise(r => setTimeout(r, 4000));
+          if (attempt < maxAttempts) {
+            await new Promise(r => setTimeout(r, 4000));
+          }
         } else if (error.response?.status === 429) {
           await new Promise(r => setTimeout(r, 25000));
         } else {
-          clearInterval(keepAlive);
-          res.write(`data: {"error":"Upstream error"}\n\n`);
-          res.end();
-          return;
+          throw error;
         }
       }
     }
 
     if (!response) {
-      clearInterval(keepAlive);
-      res.write(`data: {"error":"Timeout after retries"}\n\n`);
-      res.end();
+      throw new Error('DeepSeek timeout after all attempts');
+    }
+
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      response.data.pipe(res);
       return;
     }
 
-    // ✅ STREAM DATA TO CLIENT
-    response.data.on('data', (chunk) => {
-      res.write(chunk);
-    });
+    const openaiResponse = {
+      id: `chatcmpl-${Date.now()}`,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: model,
+      choices: response.data.choices.map(choice => ({
+        index: choice.index,
+        message: choice.message,
+        finish_reason: choice.finish_reason
+      })),
+      usage: response.data.usage || {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0
+      }
+    };
 
-    response.data.on('end', () => {
-      clearInterval(keepAlive);
-      res.end();
-    });
-
-    response.data.on('error', (err) => {
-      console.error('Stream error:', err);
-      clearInterval(keepAlive);
-      res.end();
-    });
+    res.json(openaiResponse);
 
   } catch (error) {
     console.error('Proxy error:', error.message);
 
     if (!res.headersSent) {
-      res.status(500).json({
+      res.status(error.response?.status || 500).json({
         error: {
-          message: error.message || 'Internal server error'
+          message: error.message || 'Internal server error',
+          type: 'invalid_request_error',
+          code: error.response?.status || 500
         }
       });
     }
   }
 });
 
-// 404 fallback
 app.all('*', (req, res) => {
   res.status(404).json({
     error: {
@@ -162,8 +150,7 @@ app.all('*', (req, res) => {
   });
 });
 
-// Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Proxy running on port ${PORT}`);
+  console.log(`Proxy running on port ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
 });
