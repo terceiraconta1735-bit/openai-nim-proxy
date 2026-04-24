@@ -1,8 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const http = require('http');
-const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -14,11 +12,7 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// 🔥 Keep-alive agents (HUGE stability boost)
-const httpAgent = new http.Agent({ keepAlive: true });
-const httpsAgent = new https.Agent({ keepAlive: true });
-
-// ✅ LOCKED MODELS
+// ✅ Stable model mapping
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'deepseek-ai/deepseek-v3.1',
   'gpt-4': 'deepseek-ai/deepseek-v3.1-terminus',
@@ -32,103 +26,89 @@ app.get('/health', (req, res) => {
 app.get('/v1/models', (req, res) => {
   res.json({
     object: 'list',
-    data: Object.keys(MODEL_MAPPING).map(model => ({
-      id: model,
+    data: Object.keys(MODEL_MAPPING).map(m => ({
+      id: m,
       object: 'model',
       created: Date.now(),
-      owned_by: 'nim-proxy'
+      owned_by: 'nvidia-nim-proxy'
     }))
   });
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
-  let clientDisconnected = false;
+  const startTime = Date.now();
 
-  req.on('close', () => {
-    clientDisconnected = true;
-    console.log('Client disconnected');
-  });
+  // 🔥 total allowed time (safe for Render + CF)
+  const MAX_TOTAL_TIME = 12 * 60 * 1000; // 12 minutes
 
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
 
-    const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v3.1-terminus';
+    const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v3.1';
 
     const nimRequest = {
       model: nimModel,
       messages,
-      temperature: temperature ?? 0.7,
-      max_tokens: max_tokens ?? 16384,
-      stream: !!stream
+      temperature: temperature || 0.7,
+      max_tokens: max_tokens || 16384,
+      stream: stream || false
     };
 
-    let response = null;
+    let attempt = 0;
+    let response;
 
-    const maxAttempts = 12;
-    let delay = 1500;
+    while (!response) {
+      attempt++;
 
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      if (clientDisconnected) return;
+      // 🔥 stop if too long
+      if (Date.now() - startTime > MAX_TOTAL_TIME) {
+        throw new Error('Global timeout reached');
+      }
 
       try {
-        console.log(`Attempt ${attempt}/${maxAttempts} → ${nimModel}`);
+        console.log(`Attempt ${attempt} for ${nimModel}`);
 
         response = await axios.post(
           `${NIM_API_BASE}/chat/completions`,
           nimRequest,
           {
             headers: {
-              Authorization: `Bearer ${NIM_API_KEY}`,
+              'Authorization': `Bearer ${NIM_API_KEY}`,
               'Content-Type': 'application/json'
             },
-            timeout: 60000,
-            responseType: stream ? 'stream' : 'json',
-            httpAgent,
-            httpsAgent,
-            decompress: true,
-            maxContentLength: Infinity,
-            maxBodyLength: Infinity
+            timeout: 60000, // ⬅️ longer per attempt
+            responseType: stream ? 'stream' : 'json'
           }
         );
 
-        console.log(`✅ Success on attempt ${attempt}`);
-        break;
+        console.log(`Success on attempt ${attempt}`);
 
       } catch (error) {
         const status = error.response?.status;
         const code = error.code;
 
-        console.log(`❌ Attempt ${attempt} failed:`, code || status);
+        console.log(`Attempt ${attempt} failed: ${code || status}`);
 
-        // 🔥 Only retry safe cases
+        // 🔥 exponential backoff
+        let delay = Math.min(2000 * Math.pow(1.5, attempt), 20000);
+
+        if (status === 429) delay = 20000; // rate limit
+        if (status === 503 || status === 504) delay = 5000;
+
         if (
           code === 'ECONNABORTED' ||
           status === 429 ||
-          status === 500 ||
-          status === 502 ||
           status === 503 ||
           status === 504
         ) {
-          if (attempt === maxAttempts) break;
-
-          // 🔥 Exponential backoff (critical)
           await new Promise(r => setTimeout(r, delay));
-          delay = Math.min(delay * 1.5, 10000);
-          continue;
+        } else {
+          throw error;
         }
-
-        // ❌ Non-retryable
-        throw error;
       }
     }
 
-    if (!response) {
-      throw new Error('Model did not respond after retries');
-    }
-
-    // =========================
-    // 🔥 STREAMING MODE
-    // =========================
+    // 🔥 STREAMING (critical for CF survival)
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -136,24 +116,15 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       res.flushHeaders();
 
-      // 🔥 heartbeat every 15s (prevents CF kill)
-      const heartbeat = setInterval(() => {
-        if (!res.writableEnded) {
-          res.write(': keep-alive\n\n');
-        }
-      }, 15000);
-
       response.data.on('data', chunk => {
-        if (!clientDisconnected) res.write(chunk);
+        res.write(chunk);
       });
 
       response.data.on('end', () => {
-        clearInterval(heartbeat);
         res.end();
       });
 
       response.data.on('error', err => {
-        clearInterval(heartbeat);
         console.error('Stream error:', err);
         res.end();
       });
@@ -161,38 +132,32 @@ app.post('/v1/chat/completions', async (req, res) => {
       return;
     }
 
-    // =========================
-    // 🔥 NORMAL MODE
-    // =========================
+    // 🔥 normal response
     res.json({
       id: `chatcmpl-${Date.now()}`,
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model,
-      choices: response.data.choices.map(choice => ({
-        index: choice.index,
-        message: choice.message,
-        finish_reason: choice.finish_reason
+      choices: response.data.choices.map(c => ({
+        index: c.index,
+        message: c.message,
+        finish_reason: c.finish_reason
       })),
-      usage: response.data.usage || {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0
-      }
+      usage: response.data.usage || {}
     });
 
   } catch (error) {
-    console.error('🔥 Proxy error:', error.message);
+    console.error('Proxy error FULL:', {
+      message: error.message,
+      status: error.response?.status,
+      data: error.response?.data
+    });
 
     if (!res.headersSent) {
       res.status(error.response?.status || 500).json({
-        error: {
-          message:
-            error.response?.data?.error?.message ||
-            error.message ||
-            'Unknown proxy error',
-          type: 'proxy_error',
-          code: error.response?.status || 500
+        error: error.response?.data || {
+          message: error.message,
+          type: 'proxy_error'
         }
       });
     }
@@ -210,5 +175,5 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Proxy running on port ${PORT}`);
+  console.log(`Proxy running on port ${PORT}`);
 });
