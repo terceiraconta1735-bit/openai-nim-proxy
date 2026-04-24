@@ -126,15 +126,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       throw new Error('Model did not respond after retries');
     }
 
-    // 🛑 NEW FIX: If the client already disconnected, do NOT start sending a response.
-    // Just clean up the upstream stream and exit silently.
-    if (clientDisconnected) {
-      if (response.data && response.data.destroy) {
-        response.data.destroy();
-      }
-      return;
-    }
-
     // =========================
     // 🔥 STREAMING MODE
     // =========================
@@ -145,50 +136,25 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       res.flushHeaders();
 
-      // Heartbeat every 15s (prevents CF kill)
+      // 🔥 heartbeat every 15s (prevents CF kill)
       const heartbeat = setInterval(() => {
         if (!res.writableEnded) {
           res.write(': keep-alive\n\n');
         }
       }, 15000);
 
-      // Clean up on client disconnect – destroy upstream, stop heartbeat
-      req.on('close', () => {
-        if (!res.writableEnded) {
-          clearInterval(heartbeat);
-          if (response.data) {
-            response.data.destroy();
-          }
-        }
+      response.data.on('data', chunk => {
+        if (!clientDisconnected) res.write(chunk);
       });
 
-      // Prevent crash if the response stream itself errors
-      res.on('error', (err) => {
-        clearInterval(heartbeat);
-        if (response.data) {
-          response.data.destroy();
-        }
-        console.error('Response stream error:', err.message);
-      });
-
-      // Backpressure-aware data piping (Fix #3)
-      const upstream = response.data;
-      upstream.on('data', (chunk) => {
-        if (!clientDisconnected && !res.write(chunk)) {
-          // Buffer is full – pause upstream and resume when drained
-          upstream.pause();
-          res.once('drain', () => upstream.resume());
-        }
-      });
-
-      upstream.on('end', () => {
+      response.data.on('end', () => {
         clearInterval(heartbeat);
         res.end();
       });
 
-      upstream.on('error', (err) => {
+      response.data.on('error', err => {
         clearInterval(heartbeat);
-        console.error('Upstream stream error:', err);
+        console.error('Stream error:', err);
         res.end();
       });
 
