@@ -10,36 +10,73 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
+const NIM_API_BASE =
+  process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
+
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-const httpAgent = new http.Agent({ keepAlive: true });
-const httpsAgent = new https.Agent({ keepAlive: true });
+const httpAgent = new http.Agent({
+  keepAlive: true
+});
 
-// 🔒 locked models
+const httpsAgent = new https.Agent({
+  keepAlive: true
+});
+
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'deepseek-ai/deepseek-v3.1',
   'gpt-4': 'deepseek-ai/deepseek-v3.1-terminus',
   'gpt-4-turbo': 'deepseek-ai/deepseek-v3.1'
 };
 
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
+app.get('/v1/models', (req, res) => {
+  res.json({
+    object: 'list',
+    data: Object.keys(MODEL_MAPPING).map(model => ({
+      id: model,
+      object: 'model',
+      created: Date.now(),
+      owned_by: 'nvidia-nim-proxy'
+    }))
+  });
+});
+
 app.post('/v1/chat/completions', async (req, res) => {
   req.setTimeout(0);
   res.setTimeout(0);
 
-  let clientAlive = true;
+  let responseClosed = false;
   let currentController = null;
 
-  req.on('close', () => {
-    clientAlive = false;
-    if (currentController) currentController.abort();
-    console.log('❌ Client disconnected → aborting everything');
+  // FIX: use response close instead of request close
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      responseClosed = true;
+
+      if (currentController) {
+        currentController.abort();
+      }
+
+      console.log('Client truly disconnected → aborting retries');
+    }
   });
 
   try {
-    const { model, messages, temperature, max_tokens, stream } = req.body;
+    const {
+      model,
+      messages,
+      temperature,
+      max_tokens,
+      stream
+    } = req.body;
 
-    const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v3.1-terminus';
+    const nimModel =
+      MODEL_MAPPING[model] ||
+      'deepseek-ai/deepseek-v3.1-terminus';
 
     const nimRequest = {
       model: nimModel,
@@ -49,17 +86,16 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: !!stream
     };
 
-    const GLOBAL_TIMEOUT = 180000; // 3 min
-    const REQUEST_TIMEOUT = 30000; // 30s
+    const GLOBAL_TIMEOUT = 180000;
+    const REQUEST_TIMEOUT = 30000;
     const MAX_ATTEMPTS = 8;
 
-    const startTime = Date.now();
     let response = null;
+    const startTime = Date.now();
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-
-      if (!clientAlive) {
-        console.log('🛑 Stopping retries (client gone)');
+      if (responseClosed) {
+        console.log('Stopping retries because response closed');
         return;
       }
 
@@ -67,10 +103,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         throw new Error('Global timeout reached');
       }
 
-      currentController = new AbortController();
-
       try {
-        console.log(`Attempt ${attempt}/${MAX_ATTEMPTS} → ${nimModel}`);
+        currentController = new AbortController();
+
+        console.log(
+          `Attempt ${attempt}/${MAX_ATTEMPTS} → ${nimModel}`
+        );
 
         response = await axios.post(
           `${NIM_API_BASE}/chat/completions`,
@@ -88,19 +126,21 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
         );
 
-        console.log(`✅ Success on attempt ${attempt}`);
+        console.log(`Success on attempt ${attempt}`);
         break;
 
       } catch (error) {
-        if (!clientAlive) {
-          console.log('🛑 Aborted due to client disconnect');
+        if (responseClosed) {
+          console.log('Client already gone');
           return;
         }
 
         const status = error.response?.status;
         const code = error.code;
 
-        console.log(`❌ Attempt ${attempt} failed:`, code || status);
+        console.log(
+          `Attempt ${attempt} failed: ${code || status}`
+        );
 
         if (
           code === 'ECONNABORTED' ||
@@ -111,7 +151,9 @@ app.post('/v1/chat/completions', async (req, res) => {
           status === 503 ||
           status === 504
         ) {
-          if (attempt === MAX_ATTEMPTS) break;
+          if (attempt === MAX_ATTEMPTS) {
+            break;
+          }
 
           await new Promise(r => setTimeout(r, 1500));
           continue;
@@ -125,63 +167,111 @@ app.post('/v1/chat/completions', async (req, res) => {
       throw new Error('Model did not respond after retries');
     }
 
-    // ================= STREAM =================
     if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
+      res.setHeader(
+        'Content-Type',
+        'text/event-stream'
+      );
+      res.setHeader(
+        'Cache-Control',
+        'no-cache'
+      );
+      res.setHeader(
+        'Connection',
+        'keep-alive'
+      );
 
       res.flushHeaders();
 
       const heartbeat = setInterval(() => {
-        if (clientAlive) {
+        if (!responseClosed) {
           res.write(': keep-alive\n\n');
         }
       }, 15000);
 
       response.data.on('data', chunk => {
-        if (clientAlive) res.write(chunk);
+        if (!responseClosed) {
+          res.write(chunk);
+        }
       });
 
       response.data.on('end', () => {
         clearInterval(heartbeat);
-        if (clientAlive) res.end();
+
+        if (!responseClosed) {
+          res.end();
+        }
       });
 
       response.data.on('error', err => {
         clearInterval(heartbeat);
-        console.error('Stream error:', err);
-        if (clientAlive) res.end();
+
+        console.error(
+          'Stream error:',
+          err.message
+        );
+
+        if (!responseClosed) {
+          res.end();
+        }
       });
 
       return;
     }
 
-    // ================= NORMAL =================
     res.json({
       id: `chatcmpl-${Date.now()}`,
       object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
+      created: Math.floor(
+        Date.now() / 1000
+      ),
       model,
       choices: response.data.choices,
-      usage: response.data.usage || {}
+      usage:
+        response.data.usage || {}
     });
 
   } catch (error) {
-    console.error('🔥 Proxy error:', error.message);
+    console.error(
+      'Proxy error FULL:',
+      {
+        message: error.message,
+        status:
+          error.response?.status,
+        data:
+          error.response?.data
+      }
+    );
 
     if (!res.headersSent) {
-      res.status(error.response?.status || 500).json({
+      res.status(
+        error.response?.status || 500
+      ).json({
         error: {
-          message: error.message,
+          message:
+            error.response?.data?.error?.message ||
+            error.message,
           type: 'proxy_error',
-          code: error.response?.status || 500
+          code:
+            error.response?.status || 500
         }
       });
     }
   }
 });
 
+app.all('*', (req, res) => {
+  res.status(404).json({
+    error: {
+      message: `Endpoint ${req.path} not found`,
+      type: 'invalid_request_error',
+      code: 404
+    }
+  });
+});
+
 app.listen(PORT, () => {
-  console.log(`🚀 Running on port ${PORT}`);
+  console.log(
+    `Proxy running on port ${PORT}`
+  );
 });
