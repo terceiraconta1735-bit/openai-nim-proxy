@@ -10,23 +10,16 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-const NIM_API_BASE =
-  process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
-
+const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// ⏱️ Socket & agent timeouts – match the request timeout
-const SOCKET_TIMEOUT = 120000; // 2 minutes
+// Timeouts (in ms)
+const SOCKET_TIMEOUT = 120000;       // 2 min – socket level
+const REQUEST_TIMEOUT = 120000;      // 2 min – per HTTP attempt
+const GLOBAL_TIMEOUT = 600000;       // 10 min – total request lifecycle
 
-const httpAgent = new http.Agent({
-  keepAlive: true,
-  timeout: SOCKET_TIMEOUT
-});
-
-const httpsAgent = new https.Agent({
-  keepAlive: true,
-  timeout: SOCKET_TIMEOUT
-});
+const httpAgent = new http.Agent({ keepAlive: true, timeout: SOCKET_TIMEOUT });
+const httpsAgent = new https.Agent({ keepAlive: true, timeout: SOCKET_TIMEOUT });
 
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'deepseek-ai/deepseek-v4-pro',
@@ -34,6 +27,18 @@ const MODEL_MAPPING = {
   'gpt-4-turbo': 'deepseek-ai/deepseek-v4-pro'
 };
 
+// ---------- Helper: exponential backoff with jitter ----------
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function backoff(attempt) {
+  const base = Math.min(1000 * Math.pow(2, attempt - 1), 30000); // max 30 sec
+  const jitter = Math.random() * 1000;
+  return Math.floor(base + jitter);
+}
+
+// ---------- Routes ----------
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
@@ -51,35 +56,30 @@ app.get('/v1/models', (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
+  // Disable Express's own timeouts
   req.setTimeout(0);
   res.setTimeout(0);
 
   let responseClosed = false;
   let currentController = null;
 
+  // Handle client disconnect
   res.on('close', () => {
     if (!res.writableEnded) {
       responseClosed = true;
       if (currentController) {
         currentController.abort();
       }
-      console.log('Client truly disconnected → aborting retries');
+      console.log('Client disconnected → aborting Nvidia request');
     }
   });
 
   try {
-    const {
-      model,
-      messages,
-      temperature,
-      max_tokens,
-      stream
-    } = req.body;
+    const { model, messages, temperature, max_tokens, stream } = req.body;
 
-    const nimModel =
-      MODEL_MAPPING[model] ||
-      'deepseek-ai/deepseek-v4-pro';
+    const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v4-pro';
 
+    // Use smaller default max_tokens to speed up first token (adjust as needed)
     const nimRequest = {
       model: nimModel,
       messages,
@@ -88,17 +88,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: !!stream
     };
 
-    // ⏱️ IMPORTANT FIX: generous timeouts for large models
-    const GLOBAL_TIMEOUT = 600000;   // 10 minutes total
-    const REQUEST_TIMEOUT = 120000;  // 2 minutes per attempt
     const MAX_ATTEMPTS = 8;
-
     let response = null;
     const startTime = Date.now();
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       if (responseClosed) {
-        console.log('Stopping retries because response closed');
+        console.log('Client gone → stop retries');
         return;
       }
 
@@ -109,9 +105,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       try {
         currentController = new AbortController();
 
-        console.log(
-          `Attempt ${attempt}/${MAX_ATTEMPTS} → ${nimModel}`
-        );
+        console.log(`Attempt ${attempt}/${MAX_ATTEMPTS} → ${nimModel}`);
 
         response = await axios.post(
           `${NIM_API_BASE}/chat/completions`,
@@ -131,7 +125,6 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         console.log(`Success on attempt ${attempt}`);
         break;
-
       } catch (error) {
         if (responseClosed) {
           console.log('Client already gone');
@@ -140,11 +133,15 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         const status = error.response?.status;
         const code = error.code;
+        console.log(`Attempt ${attempt} failed: ${code || status}`);
 
-        console.log(
-          `Attempt ${attempt} failed: ${code || status}`
-        );
+        // 🔍 Log the full error details for non‑retryable (400‑series) errors
+        if (status && status >= 400 && status < 500 && status !== 429) {
+          console.error('Non‑retryable error body:', JSON.stringify(error.response?.data));
+          throw error;   // do not retry
+        }
 
+        // Retry only for these transient / overload situations
         if (
           code === 'ECONNABORTED' ||
           code === 'ERR_CANCELED' ||
@@ -154,16 +151,15 @@ app.post('/v1/chat/completions', async (req, res) => {
           status === 503 ||
           status === 504
         ) {
-          if (attempt === MAX_ATTEMPTS) {
-            break;
-          }
+          if (attempt === MAX_ATTEMPTS) break;
 
-          // Wait a bit before next retry
-          await new Promise(r => setTimeout(r, 1500));
+          const delay = backoff(attempt);
+          console.log(`Backing off for ${delay}ms before next attempt`);
+          await sleep(delay);
           continue;
         }
 
-        // Non-retryable error → stop immediately
+        // Any other error → abort immediately
         throw error;
       }
     }
@@ -172,56 +168,40 @@ app.post('/v1/chat/completions', async (req, res) => {
       throw new Error('Model did not respond after retries');
     }
 
+    // ---------- Streaming path ----------
     if (stream) {
-      res.setHeader(
-        'Content-Type',
-        'text/event-stream'
-      );
-      res.setHeader(
-        'Cache-Control',
-        'no-cache'
-      );
-      res.setHeader(
-        'Connection',
-        'keep-alive'
-      );
-
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
       res.flushHeaders();
 
+      // 🚀 Send an immediate comment to prevent Render's 100s timeout
+      //    while waiting for the first real token. This is valid SSE.
+      if (!responseClosed) res.write(': warmup\n\n');
+
       const heartbeat = setInterval(() => {
-        if (!responseClosed) {
-          res.write(': keep-alive\n\n');
-        }
+        if (!responseClosed) res.write(': keep-alive\n\n');
       }, 15000);
 
       response.data.on('data', chunk => {
-        if (!responseClosed) {
-          res.write(chunk);
-        }
+        if (!responseClosed) res.write(chunk);
       });
 
       response.data.on('end', () => {
         clearInterval(heartbeat);
-        if (!responseClosed) {
-          res.end();
-        }
+        if (!responseClosed) res.end();
       });
 
       response.data.on('error', err => {
         clearInterval(heartbeat);
-        console.error(
-          'Stream error:',
-          err.message
-        );
-        if (!responseClosed) {
-          res.end();
-        }
+        console.error('Stream error:', err.message);
+        if (!responseClosed) res.end();
       });
 
       return;
     }
 
-    // Non-streaming response
+    // ---------- Non‑streaming path ----------
     res.json({
       id: `chatcmpl-${Date.now()}`,
       object: 'chat.completion',
@@ -232,23 +212,16 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
 
   } catch (error) {
-    console.error(
-      'Proxy error FULL:',
-      {
-        message: error.message,
-        status: error.response?.status,
-        data: error.response?.data
-      }
-    );
+    console.error('Proxy error FULL:', {
+      message: error.message,
+      status: error.response?.status,
+      data: error.response?.data
+    });
 
     if (!res.headersSent) {
-      res.status(
-        error.response?.status || 500
-      ).json({
+      res.status(error.response?.status || 500).json({
         error: {
-          message:
-            error.response?.data?.error?.message ||
-            error.message,
+          message: error.response?.data?.error?.message || error.message,
           type: 'proxy_error',
           code: error.response?.status || 500
         }
@@ -268,7 +241,5 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(
-    `Proxy running on port ${PORT}`
-  );
+  console.log(`Proxy running on port ${PORT}`);
 });
