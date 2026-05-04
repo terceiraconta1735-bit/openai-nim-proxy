@@ -24,9 +24,9 @@ const httpsAgent = new https.Agent({
 });
 
 const MODEL_MAPPING = {
-  'gpt-3.5-turbo': 'deepseek-ai/deepseek-v3.1',
-  'gpt-4': 'deepseek-ai/deepseek-v3.1-terminus',
-  'gpt-4-turbo': 'deepseek-ai/deepseek-v3.1'
+  'gpt-3.5-turbo': 'deepseek-ai/deepseek-v4-pro',
+  'gpt-4': 'deepseek-ai/deepseek-v4-pro',
+  'gpt-4-turbo': 'deepseek-ai/deepseek-v4-pro'
 };
 
 app.get('/health', (req, res) => {
@@ -76,7 +76,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     const nimModel =
       MODEL_MAPPING[model] ||
-      'deepseek-ai/deepseek-v3.1-terminus';
+      'deepseek-ai/deepseek-v4-pro';
 
     const nimRequest = {
       model: nimModel,
