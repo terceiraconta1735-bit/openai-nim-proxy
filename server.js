@@ -15,12 +15,17 @@ const NIM_API_BASE =
 
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
+// ⏱️ Socket & agent timeouts – match the request timeout
+const SOCKET_TIMEOUT = 120000; // 2 minutes
+
 const httpAgent = new http.Agent({
-  keepAlive: true
+  keepAlive: true,
+  timeout: SOCKET_TIMEOUT
 });
 
 const httpsAgent = new https.Agent({
-  keepAlive: true
+  keepAlive: true,
+  timeout: SOCKET_TIMEOUT
 });
 
 const MODEL_MAPPING = {
@@ -52,15 +57,12 @@ app.post('/v1/chat/completions', async (req, res) => {
   let responseClosed = false;
   let currentController = null;
 
-  // FIX: use response close instead of request close
   res.on('close', () => {
     if (!res.writableEnded) {
       responseClosed = true;
-
       if (currentController) {
         currentController.abort();
       }
-
       console.log('Client truly disconnected → aborting retries');
     }
   });
@@ -86,8 +88,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: !!stream
     };
 
-    const GLOBAL_TIMEOUT = 180000;
-    const REQUEST_TIMEOUT = 30000;
+    // ⏱️ IMPORTANT FIX: generous timeouts for large models
+    const GLOBAL_TIMEOUT = 600000;   // 10 minutes total
+    const REQUEST_TIMEOUT = 120000;  // 2 minutes per attempt
     const MAX_ATTEMPTS = 8;
 
     let response = null;
@@ -155,10 +158,12 @@ app.post('/v1/chat/completions', async (req, res) => {
             break;
           }
 
+          // Wait a bit before next retry
           await new Promise(r => setTimeout(r, 1500));
           continue;
         }
 
+        // Non-retryable error → stop immediately
         throw error;
       }
     }
@@ -197,7 +202,6 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       response.data.on('end', () => {
         clearInterval(heartbeat);
-
         if (!responseClosed) {
           res.end();
         }
@@ -205,12 +209,10 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       response.data.on('error', err => {
         clearInterval(heartbeat);
-
         console.error(
           'Stream error:',
           err.message
         );
-
         if (!responseClosed) {
           res.end();
         }
@@ -219,16 +221,14 @@ app.post('/v1/chat/completions', async (req, res) => {
       return;
     }
 
+    // Non-streaming response
     res.json({
       id: `chatcmpl-${Date.now()}`,
       object: 'chat.completion',
-      created: Math.floor(
-        Date.now() / 1000
-      ),
+      created: Math.floor(Date.now() / 1000),
       model,
       choices: response.data.choices,
-      usage:
-        response.data.usage || {}
+      usage: response.data.usage || {}
     });
 
   } catch (error) {
@@ -236,10 +236,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       'Proxy error FULL:',
       {
         message: error.message,
-        status:
-          error.response?.status,
-        data:
-          error.response?.data
+        status: error.response?.status,
+        data: error.response?.data
       }
     );
 
@@ -252,8 +250,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             error.response?.data?.error?.message ||
             error.message,
           type: 'proxy_error',
-          code:
-            error.response?.status || 500
+          code: error.response?.status || 500
         }
       });
     }
