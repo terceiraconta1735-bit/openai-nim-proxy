@@ -27,22 +27,20 @@ const MODEL_MAPPING = {
   'gpt-4-turbo': 'deepseek-ai/deepseek-v4-pro'
 };
 
-// ----- Concurrency limiter (prevents flooding Nvidia) -----
-let activeRequests = 0;
-const MAX_CONCURRENT = 2;   // send at most 2 requests at a time
+// ----- Rate-limit controls (40 RPM – safe with 2s between requests) -----
+const MIN_REQUEST_INTERVAL_MS = 2000;   // 2 seconds between requests
+let lastRequestTime = 0;
 
-function canProceed() {
-  return activeRequests < MAX_CONCURRENT;
-}
+// Serial queue – processes one request at a time
+let processingQueue = Promise.resolve();
 
-// ----- Helper functions -----
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function backoff(attempt) {
-  const base = Math.min(2000 * Math.pow(2, attempt - 1), 60000);
-  const jitter = Math.random() * 1000;
+  const base = Math.min(5000 * Math.pow(2, attempt - 1), 60000);
+  const jitter = Math.random() * 2000;
   return Math.floor(base + jitter);
 }
 
@@ -78,182 +76,211 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
   });
 
-  // ----- Concurrency gate: wait until a slot opens -----
-  while (!canProceed() && !responseClosed) {
-    await sleep(500);
-  }
-  if (responseClosed) return;
-  activeRequests++;
+  // ----- Enter the serial queue with enforced pacing -----
+  processingQueue = processingQueue.then(async () => {
+    // Wait until at least MIN_REQUEST_INTERVAL_MS has passed since the last request *started*
+    const now = Date.now();
+    const wait = Math.max(0, lastRequestTime + MIN_REQUEST_INTERVAL_MS - now);
+    if (wait > 0) {
+      console.log(`Cool-down: waiting ${wait}ms before next request`);
+      await sleep(wait);
+    }
+    lastRequestTime = Date.now();
 
-  try {
-    const { model, messages, temperature, max_tokens, stream } = req.body;
-    const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v4-pro';
+    try {
+      const { model, messages, temperature, max_tokens, stream } = req.body;
+      const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v4-pro';
 
-    const nimRequest = {
-      model: nimModel,
-      messages,
-      temperature: temperature ?? 0.7,
-      max_tokens: max_tokens ?? 16384,    // keep your long replies
-      stream: !!stream
-    };
+      const nimRequest = {
+        model: nimModel,
+        messages,
+        temperature: temperature ?? 0.7,
+        max_tokens: max_tokens ?? 16384,
+        stream: !!stream
+      };
 
-    const MAX_ATTEMPTS = 5;   // slightly reduced to not hammer for 10 min on obvious errors
-    let response = null;
-    const startTime = Date.now();
+      const MAX_ATTEMPTS = 3;   // 3 attempts are enough – no need to hammer
+      let response = null;
+      const startTime = Date.now();
 
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      if (responseClosed) {
-        console.log('Client gone → stop retries');
-        break;
-      }
-      if (Date.now() - startTime > GLOBAL_TIMEOUT) {
-        throw new Error('Global timeout reached');
-      }
-
-      try {
-        currentController = new AbortController();
-        console.log(`Attempt ${attempt}/${MAX_ATTEMPTS} → ${nimModel}`);
-
-        response = await axios.post(
-          `${NIM_API_BASE}/chat/completions`,
-          nimRequest,
-          {
-            headers: {
-              Authorization: `Bearer ${NIM_API_KEY}`,
-              'Content-Type': 'application/json'
-            },
-            timeout: REQUEST_TIMEOUT,
-            responseType: stream ? 'stream' : 'text',   // ← get as text for full error visibility
-            httpAgent,
-            httpsAgent,
-            signal: currentController.signal,
-            transformResponse: [(data) => data]          // keep raw string, we'll parse manually
-          }
-        );
-
-        // If non-streaming, parse the response text into JSON
-        if (!stream) {
-          try {
-            response.data = JSON.parse(response.data);
-          } catch (e) {
-            console.error('Failed to parse Nvidia JSON:', response.data);
-            throw new Error('Invalid JSON from Nvidia');
-          }
-        }
-
-        console.log(`Success on attempt ${attempt}`);
-        break;
-      } catch (error) {
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         if (responseClosed) {
-          console.log('Client already gone');
+          console.log('Client gone → stop retries');
           break;
         }
+        if (Date.now() - startTime > GLOBAL_TIMEOUT) {
+          throw new Error('Global timeout reached');
+        }
 
-        // ─── Extract error details robustly ────────────────
-        const status = error.response?.status;
-        const code = error.code;
-        let nvidiaErrorMessage = '';
+        try {
+          currentController = new AbortController();
+          console.log(`Attempt ${attempt}/${MAX_ATTEMPTS} → ${nimModel}`);
 
-        // Try to read the error body as text, even if parsing failed
-        if (error.response?.data) {
-          if (typeof error.response.data === 'string') {
-            nvidiaErrorMessage = error.response.data.substring(0, 500);
-          } else {
+          response = await axios.post(
+            `${NIM_API_BASE}/chat/completions`,
+            nimRequest,
+            {
+              headers: {
+                Authorization: `Bearer ${NIM_API_KEY}`,
+                'Content-Type': 'application/json'
+              },
+              timeout: REQUEST_TIMEOUT,
+              responseType: stream ? 'stream' : 'text',   // get raw text for error parsing
+              httpAgent,
+              httpsAgent,
+              signal: currentController.signal,
+              transformResponse: [(data) => data]          // keep raw string
+            }
+          );
+
+          // Parse JSON for non‑streaming requests
+          if (!stream) {
             try {
-              nvidiaErrorMessage = JSON.stringify(error.response.data).substring(0, 500);
-            } catch {}
+              response.data = JSON.parse(response.data);
+            } catch (e) {
+              console.error('Failed to parse Nvidia JSON:', response.data);
+              throw new Error('Invalid JSON from Nvidia');
+            }
           }
+
+          console.log(`Success on attempt ${attempt}`);
+          break;
+        } catch (error) {
+          if (responseClosed) {
+            console.log('Client already gone');
+            break;
+          }
+
+          const status = error.response?.status;
+          const code = error.code;
+          let nvidiaErrorBody = '';
+          let retryAfterSec = null;
+
+          // ── Extract the full error body ─────────────────
+          if (error.response?.data) {
+            if (typeof error.response.data === 'string') {
+              nvidiaErrorBody = error.response.data.substring(0, 500);
+              try {
+                const parsed = JSON.parse(error.response.data);
+                if (parsed?.detail) {
+                  nvidiaErrorBody = JSON.stringify(parsed.detail);
+                }
+              } catch {}
+            } else {
+              nvidiaErrorBody = JSON.stringify(error.response.data).substring(0, 500);
+            }
+          }
+
+          // Check for Retry-After header
+          const retryAfterHeader = error.response?.headers?.['retry-after'];
+          if (retryAfterHeader) {
+            retryAfterSec = parseInt(retryAfterHeader, 10);
+            if (isNaN(retryAfterSec)) retryAfterSec = null;
+          }
+
+          // ── Log the error clearly ─────────────────────
+          console.log(`Attempt ${attempt} failed: HTTP ${status} / code ${code}`);
+          if (nvidiaErrorBody) {
+            console.log(`Nvidia error body: ${nvidiaErrorBody}`);
+          }
+
+          // ── 429 handling ─────────────────────────────
+          if (status === 429) {
+            if (attempt === MAX_ATTEMPTS) break;
+
+            let delay;
+            if (retryAfterSec && retryAfterSec > 0 && retryAfterSec <= 120) {
+              delay = retryAfterSec * 1000;
+              console.log(`Using Retry-After header: ${delay}ms`);
+            } else {
+              delay = backoff(attempt);
+              console.log(`No/Invalid Retry-After, using backoff: ${delay}ms`);
+            }
+            await sleep(delay);
+            continue;
+          }
+
+          // ── Network / server errors → retry ─────────
+          if (
+            code === 'ECONNABORTED' ||
+            code === 'ERR_CANCELED' ||
+            status === 502 || status === 503 || status === 504
+          ) {
+            if (attempt === MAX_ATTEMPTS) break;
+            const delay = backoff(attempt);
+            console.log(`Network/server error, backing off for ${delay}ms`);
+            await sleep(delay);
+            continue;
+          }
+
+          // ── Anything else (4xx except 429) → hard fail ─
+          throw new Error(`Nvidia API error: ${status || code} – ${nvidiaErrorBody || error.message}`);
         }
+      }
 
-        console.log(`Attempt ${attempt} failed: HTTP ${status} / code ${code}`);
-        if (nvidiaErrorMessage) {
-          console.log(`Nvidia error body: ${nvidiaErrorMessage}`);
-        }
+      if (!response) {
+        throw new Error('Model did not respond after retries');
+      }
 
-        // ─── Decide whether to retry ──────────────────────
-        // Always retry on network/timeout errors and on 429 rate limit
-        const isNetworkError = code === 'ECONNABORTED' || code === 'ERR_CANCELED';
-        const isRateLimit = status === 429;
-        // CRITICAL: some rate limits come back as 400 with a specific message
-        const isPotentialRateLimit400 = status === 400 && nvidiaErrorMessage.toLowerCase().includes('rate');
+      // ----- Streaming response ──────────────────────
+      if (stream) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders();
 
-        const shouldRetry = isNetworkError || isRateLimit || isPotentialRateLimit400 ||
-                            status === 500 || status === 502 || status === 503 || status === 504;
+        if (!responseClosed) res.write(': warmup\n\n');
 
-        if (!shouldRetry) {
-          // Non-retryable error → stop and throw immediately
-          throw new Error(`Nvidia API error: ${status || code} – ${nvidiaErrorMessage || error.message}`);
-        }
+        const heartbeat = setInterval(() => {
+          if (!responseClosed) res.write(': keep-alive\n\n');
+        }, 15000);
 
-        // Retry with backoff
-        if (attempt === MAX_ATTEMPTS) break;
+        response.data.on('data', chunk => {
+          if (!responseClosed) res.write(chunk);
+        });
 
-        const delay = backoff(attempt);
-        console.log(`Backing off for ${delay}ms before next attempt`);
-        await sleep(delay);
+        response.data.on('end', () => {
+          clearInterval(heartbeat);
+          if (!responseClosed) res.end();
+        });
+
+        response.data.on('error', err => {
+          clearInterval(heartbeat);
+          console.error('Stream error:', err.message);
+          if (!responseClosed) res.end();
+        });
+
+        return;
+      }
+
+      // ----- Non‑streaming response ────────────────────
+      res.json({
+        id: `chatcmpl-${Date.now()}`,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: response.data.choices,
+        usage: response.data.usage || {}
+      });
+
+    } catch (error) {
+      console.error('Proxy error:', error.message);
+      if (!res.headersSent) {
+        res.status(error.response?.status || 502).json({
+          error: {
+            message: error.message,
+            type: 'proxy_error',
+            code: error.response?.status || 502
+          }
+        });
       }
     }
+  }).catch(err => {
+    console.error('Queue processing error:', err);
+  });
 
-    if (!response) {
-      throw new Error('Model did not respond after retries');
-    }
-
-    // ----- Streaming path -----
-    if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      res.flushHeaders();
-
-      // Warmup comment to keep Render alive
-      if (!responseClosed) res.write(': warmup\n\n');
-
-      const heartbeat = setInterval(() => {
-        if (!responseClosed) res.write(': keep-alive\n\n');
-      }, 15000);
-
-      response.data.on('data', chunk => {
-        if (!responseClosed) res.write(chunk);
-      });
-
-      response.data.on('end', () => {
-        clearInterval(heartbeat);
-        if (!responseClosed) res.end();
-      });
-
-      response.data.on('error', err => {
-        clearInterval(heartbeat);
-        console.error('Stream error:', err.message);
-        if (!responseClosed) res.end();
-      });
-
-      return;
-    }
-
-    // ----- Non‑streaming path -----
-    res.json({
-      id: `chatcmpl-${Date.now()}`,
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: response.data.choices,
-      usage: response.data.usage || {}
-    });
-
-  } catch (error) {
-    console.error('Proxy error:', error.message);
-    if (!res.headersSent) {
-      res.status(error.response?.status || 502).json({
-        error: {
-          message: error.response?.data?.error?.message || error.message,
-          type: 'proxy_error',
-          code: error.response?.status || 502
-        }
-      });
-    }
-  } finally {
-    activeRequests = Math.max(0, activeRequests - 1);
-  }
+  // Dummy return – Express must not wait for the chain
+  return new Promise(() => {});
 });
 
 app.all('*', (req, res) => {
