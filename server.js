@@ -28,10 +28,9 @@ const MODEL_MAPPING = {
 };
 
 // ----- Rate-limit controls (40 RPM – safe with 2s between requests) -----
-const MIN_REQUEST_INTERVAL_MS = 2000;   // 2 seconds between requests
+const MIN_REQUEST_INTERVAL_MS = 2000;
 let lastRequestTime = 0;
 
-// Serial queue – processes one request at a time
 let processingQueue = Promise.resolve();
 
 function sleep(ms) {
@@ -76,9 +75,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
   });
 
-  // ----- Enter the serial queue with enforced pacing -----
   processingQueue = processingQueue.then(async () => {
-    // Wait until at least MIN_REQUEST_INTERVAL_MS has passed since the last request *started*
     const now = Date.now();
     const wait = Math.max(0, lastRequestTime + MIN_REQUEST_INTERVAL_MS - now);
     if (wait > 0) {
@@ -99,7 +96,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         stream: !!stream
       };
 
-      const MAX_ATTEMPTS = 3;   // 3 attempts are enough – no need to hammer
+      const MAX_ATTEMPTS = 3;
       let response = null;
       const startTime = Date.now();
 
@@ -125,15 +122,14 @@ app.post('/v1/chat/completions', async (req, res) => {
                 'Content-Type': 'application/json'
               },
               timeout: REQUEST_TIMEOUT,
-              responseType: stream ? 'stream' : 'text',   // get raw text for error parsing
+              responseType: stream ? 'stream' : 'text',
               httpAgent,
               httpsAgent,
               signal: currentController.signal,
-              transformResponse: [(data) => data]          // keep raw string
+              transformResponse: [(data) => data]
             }
           );
 
-          // Parse JSON for non‑streaming requests
           if (!stream) {
             try {
               response.data = JSON.parse(response.data);
@@ -156,7 +152,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           let nvidiaErrorBody = '';
           let retryAfterSec = null;
 
-          // ── Extract the full error body ─────────────────
+          // ── EXTRACT ERROR BODY SAFELY (FIXED) ────────
           if (error.response?.data) {
             if (typeof error.response.data === 'string') {
               nvidiaErrorBody = error.response.data.substring(0, 500);
@@ -166,25 +162,29 @@ app.post('/v1/chat/completions', async (req, res) => {
                   nvidiaErrorBody = JSON.stringify(parsed.detail);
                 }
               } catch {}
+            } else if (typeof error.response.data === 'object') {
+              try {
+                nvidiaErrorBody = JSON.stringify(error.response.data).substring(0, 500);
+              } catch {
+                // Stream or circular object → safe fallback
+                nvidiaErrorBody = `[Unstringifiable object: ${typeof error.response.data}]`;
+              }
             } else {
-              nvidiaErrorBody = JSON.stringify(error.response.data).substring(0, 500);
+              nvidiaErrorBody = String(error.response.data).substring(0, 500);
             }
           }
 
-          // Check for Retry-After header
           const retryAfterHeader = error.response?.headers?.['retry-after'];
           if (retryAfterHeader) {
             retryAfterSec = parseInt(retryAfterHeader, 10);
             if (isNaN(retryAfterSec)) retryAfterSec = null;
           }
 
-          // ── Log the error clearly ─────────────────────
           console.log(`Attempt ${attempt} failed: HTTP ${status} / code ${code}`);
           if (nvidiaErrorBody) {
             console.log(`Nvidia error body: ${nvidiaErrorBody}`);
           }
 
-          // ── 429 handling ─────────────────────────────
           if (status === 429) {
             if (attempt === MAX_ATTEMPTS) break;
 
@@ -200,7 +200,6 @@ app.post('/v1/chat/completions', async (req, res) => {
             continue;
           }
 
-          // ── Network / server errors → retry ─────────
           if (
             code === 'ECONNABORTED' ||
             code === 'ERR_CANCELED' ||
@@ -213,7 +212,6 @@ app.post('/v1/chat/completions', async (req, res) => {
             continue;
           }
 
-          // ── Anything else (4xx except 429) → hard fail ─
           throw new Error(`Nvidia API error: ${status || code} – ${nvidiaErrorBody || error.message}`);
         }
       }
@@ -222,7 +220,6 @@ app.post('/v1/chat/completions', async (req, res) => {
         throw new Error('Model did not respond after retries');
       }
 
-      // ----- Streaming response ──────────────────────
       if (stream) {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -253,7 +250,6 @@ app.post('/v1/chat/completions', async (req, res) => {
         return;
       }
 
-      // ----- Non‑streaming response ────────────────────
       res.json({
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
@@ -279,7 +275,6 @@ app.post('/v1/chat/completions', async (req, res) => {
     console.error('Queue processing error:', err);
   });
 
-  // Dummy return – Express must not wait for the chain
   return new Promise(() => {});
 });
 
