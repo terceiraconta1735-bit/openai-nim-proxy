@@ -22,7 +22,7 @@ const httpAgent = new http.Agent({ keepAlive: true, timeout: SOCKET_TIMEOUT });
 const httpsAgent = new https.Agent({ keepAlive: true, timeout: SOCKET_TIMEOUT });
 
 const MODEL_MAPPING = {
-  'gpt-3.5-turbo': 'deepseek-ai/deepseek-v4-pro',
+  'gpt-3.5-turbo': 'deepseek-ai/deepseek-v4-flash',
   'gpt-4': 'deepseek-ai/deepseek-v4-pro',
   'gpt-4-turbo': 'deepseek-ai/deepseek-v4-pro'
 };
@@ -86,7 +86,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     try {
       const { model, messages, temperature, max_tokens, stream } = req.body;
-      const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v4-pro';
+      const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v4-flash';
 
       const nimRequest = {
         model: nimModel,
