@@ -27,10 +27,11 @@ const httpAgent = new http.Agent({ keepAlive: true, timeout: SOCKET_TIMEOUT });
 const httpsAgent = new https.Agent({ keepAlive: true, timeout: SOCKET_TIMEOUT });
 
 // ---------- Model mapping (OpenAI aliases → OpenRouter free models) ----------
+// Now using DeepSeek V4 Flash, which is optimized for speed and efficiency.
 const MODEL_MAPPING = {
-  'gpt-3.5-turbo': 'deepseek/deepseek-v4-pro:free',
-  'gpt-4': 'deepseek/deepseek-v4-pro:free',
-  'gpt-4-turbo': 'deepseek/deepseek-v4-pro:free',
+  'gpt-3.5-turbo': 'deepseek/deepseek-v4-flash:free',
+  'gpt-4': 'deepseek/deepseek-v4-flash:free',
+  'gpt-4-turbo': 'deepseek/deepseek-v4-flash:free',
 };
 
 // ---------- Rate‑limit pacing (OpenRouter free: 20 req/min, 200/day) ----------
@@ -92,7 +93,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     try {
       const { model, messages, temperature, max_tokens, stream } = req.body;
-      const orModel = MODEL_MAPPING[model] || 'deepseek/deepseek-v4-pro:free';
+      const orModel = MODEL_MAPPING[model] || 'deepseek/deepseek-v4-flash:free';
 
       // ---------- Streaming path ----------
       if (stream) {
@@ -167,8 +168,8 @@ app.post('/v1/chat/completions', async (req, res) => {
               headers: {
                 Authorization: `Bearer ${OPENROUTER_API_KEY}`,
                 'Content-Type': 'application/json',
-                'HTTP-Referer': 'https://janitor.ai',     // OpenRouter wants a referer
-                'X-Title': 'Janitor AI Proxy'              // and a title
+                'HTTP-Referer': 'https://janitor.ai',
+                'X-Title': 'Janitor AI Proxy'
               },
               timeout: REQUEST_TIMEOUT,
               responseType: 'json',
