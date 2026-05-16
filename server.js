@@ -1,4 +1,4 @@
-// server.js — Hugging Face Inference Providers Proxy for Janitor.AI (Updated)
+// server.js — OpenRouter Free‑Tier Proxy for Janitor.AI
 // Deploy on Render.com
 
 const express = require('express');
@@ -13,29 +13,28 @@ const PORT = process.env.PORT || 10000;
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// ---------- Hugging Face configuration ----------
-// The base URL remains the same for the Chat Completions endpoint
-const HF_API_BASE = process.env.HF_API_BASE || 'https://router.huggingface.co/hf-inference/v1';
-const HF_API_KEY = process.env.HF_API_KEY;
+// ---------- OpenRouter configuration ----------
+const OPENROUTER_API_BASE =
+  process.env.OPENROUTER_API_BASE || 'https://openrouter.ai/api/v1';
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 
-// Timeouts (generous)
-const SOCKET_TIMEOUT = 90000;          // 90 seconds
-const REQUEST_TIMEOUT = 90000;         // 90 seconds per attempt
-const GLOBAL_TIMEOUT = 600000;         // 10 minutes overall
+// Timeouts
+const SOCKET_TIMEOUT = 180000;         // 3 minutes
+const REQUEST_TIMEOUT = 180000;        // 3 minutes per attempt
+const GLOBAL_TIMEOUT = 900000;         // 15 minutes overall
 
 const httpAgent = new http.Agent({ keepAlive: true, timeout: SOCKET_TIMEOUT });
 const httpsAgent = new https.Agent({ keepAlive: true, timeout: SOCKET_TIMEOUT });
 
-// ---------- Model mapping (OpenAI aliases → Hugging Face model IDs) ----------
-// Using the format for Inference Providers
+// ---------- Model mapping (OpenAI aliases → OpenRouter free models) ----------
 const MODEL_MAPPING = {
-  'gpt-3.5-turbo': 'deepseek-ai/DeepSeek-V4-Pro',
-  'gpt-4': 'deepseek-ai/DeepSeek-V4-Pro',
-  'gpt-4-turbo': 'deepseek-ai/DeepSeek-V4-Pro',
+  'gpt-3.5-turbo': 'deepseek/deepseek-v4-pro:free',
+  'gpt-4': 'deepseek/deepseek-v4-pro:free',
+  'gpt-4-turbo': 'deepseek/deepseek-v4-pro:free',
 };
 
-// ---------- Rate‑limit pacing ----------
-const MIN_REQUEST_INTERVAL_MS = 2000; // 2 seconds to be extra safe
+// ---------- Rate‑limit pacing (OpenRouter free: 20 req/min, 200/day) ----------
+const MIN_REQUEST_INTERVAL_MS = 3000;   // 3 seconds between starts
 let lastRequestTime = 0;
 let processingQueue = Promise.resolve();
 
@@ -59,7 +58,7 @@ app.get('/v1/models', (req, res) => {
       id: model,
       object: 'model',
       created: Date.now(),
-      owned_by: 'huggingface-proxy'
+      owned_by: 'openrouter-proxy'
     }))
   });
 });
@@ -77,7 +76,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       if (currentController) {
         currentController.abort();
       }
-      console.log('Client disconnected → aborting HF request');
+      console.log('Client disconnected → aborting OpenRouter request');
     }
   });
 
@@ -93,10 +92,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     try {
       const { model, messages, temperature, max_tokens, stream } = req.body;
-      // The model ID is used as-is, without a ':free' suffix, as it's an Inference Provider
-      const hfModel = MODEL_MAPPING[model] || 'deepseek-ai/DeepSeek-V4-Pro';
+      const orModel = MODEL_MAPPING[model] || 'deepseek/deepseek-v4-pro:free';
 
-      // ---------- Streaming path: start SSE immediately, keep client alive ----------
+      // ---------- Streaming path ----------
       if (stream) {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -112,22 +110,22 @@ app.post('/v1/chat/completions', async (req, res) => {
         }, 15000);
 
         try {
-          const hfStream = await fetchHFStream(hfModel, messages, temperature, max_tokens, responseClosed);
+          const orStream = await fetchOpenRouterStream(orModel, messages, temperature, max_tokens, responseClosed);
           clearInterval(heartbeat);
 
-          hfStream.on('data', chunk => {
+          orStream.on('data', chunk => {
             if (!responseClosed) res.write(chunk);
           });
-          hfStream.on('end', () => {
+          orStream.on('end', () => {
             if (!responseClosed) res.end();
           });
-          hfStream.on('error', err => {
+          orStream.on('error', err => {
             console.error('Stream error:', err.message);
             if (!responseClosed) res.end();
           });
         } catch (err) {
           clearInterval(heartbeat);
-          console.error('HF streaming error:', err.message);
+          console.error('OpenRouter streaming error:', err.message);
           if (!responseClosed) {
             res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
             res.end();
@@ -137,8 +135,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
 
       // ---------- Non‑streaming path ----------
-      const hfRequest = {
-        model: hfModel,
+      const orRequest = {
+        model: orModel,
         messages,
         temperature: temperature ?? 0.7,
         max_tokens: max_tokens ?? 16384,
@@ -160,15 +158,17 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         try {
           currentController = new AbortController();
-          console.log(`Attempt ${attempt}/${MAX_ATTEMPTS} → ${hfModel}`);
+          console.log(`Attempt ${attempt}/${MAX_ATTEMPTS} → ${orModel}`);
 
           response = await axios.post(
-            `${HF_API_BASE}/chat/completions`,
-            hfRequest,
+            `${OPENROUTER_API_BASE}/chat/completions`,
+            orRequest,
             {
               headers: {
-                Authorization: `Bearer ${HF_API_KEY}`,
-                'Content-Type': 'application/json'
+                Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+                'Content-Type': 'application/json',
+                'HTTP-Referer': 'https://janitor.ai',     // OpenRouter wants a referer
+                'X-Title': 'Janitor AI Proxy'              // and a title
               },
               timeout: REQUEST_TIMEOUT,
               responseType: 'json',
@@ -193,9 +193,8 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
 
           console.log(`Attempt ${attempt} failed: HTTP ${status} / code ${code}`);
-          if (errorBody) console.log(`HF error body: ${errorBody}`);
+          if (errorBody) console.log(`OpenRouter error body: ${errorBody}`);
 
-          // Retry only on network errors, rate limits (429), and server errors (5xx)
           const retryable =
             code === 'ECONNABORTED' ||
             code === 'ERR_CANCELED' ||
@@ -209,8 +208,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             continue;
           }
 
-          // Non‑retryable → throw
-          throw new Error(`HF API error: ${status || code} – ${errorBody}`);
+          throw new Error(`OpenRouter API error: ${status || code} – ${errorBody}`);
         }
       }
 
@@ -242,10 +240,10 @@ app.post('/v1/chat/completions', async (req, res) => {
   return new Promise(() => {});
 });
 
-// ---------- Helper: fetch a Hugging Face streaming response with retries ----------
-async function fetchHFStream(model, messages, temperature, max_tokens, responseClosed) {
-  const hfRequest = {
-    model: model,
+// ---------- Helper: fetch a streaming response from OpenRouter with retries ----------
+async function fetchOpenRouterStream(model, messages, temperature, max_tokens, responseClosed) {
+  const orRequest = {
+    model,
     messages,
     temperature: temperature ?? 0.7,
     max_tokens: max_tokens ?? 16384,
@@ -262,12 +260,14 @@ async function fetchHFStream(model, messages, temperature, max_tokens, responseC
     try {
       console.log(`Stream attempt ${attempt}/${MAX_ATTEMPTS} → ${model}`);
       const response = await axios.post(
-        `${HF_API_BASE}/chat/completions`,
-        hfRequest,
+        `${OPENROUTER_API_BASE}/chat/completions`,
+        orRequest,
         {
           headers: {
-            Authorization: `Bearer ${HF_API_KEY}`,
-            'Content-Type': 'application/json'
+            Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'https://janitor.ai',
+            'X-Title': 'Janitor AI Proxy'
           },
           timeout: REQUEST_TIMEOUT,
           responseType: 'stream',
@@ -295,7 +295,7 @@ async function fetchHFStream(model, messages, temperature, max_tokens, responseC
           continue;
         }
       }
-      throw new Error(`HF stream error: ${status || code}`);
+      throw new Error(`OpenRouter stream error: ${status || code}`);
     }
   }
   throw new Error('Stream did not respond after retries');
