@@ -1,3 +1,6 @@
+// server.js — Hugging Face Inference Providers Proxy for Janitor.AI (Updated)
+// Deploy on Render.com
+
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -5,36 +8,37 @@ const http = require('http');
 const https = require('https');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// ----- Nvidia NIM configuration -----
-const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
-const NIM_API_KEY = process.env.NIM_API_KEY;
+// ---------- Hugging Face configuration ----------
+// The base URL remains the same for the Chat Completions endpoint
+const HF_API_BASE = process.env.HF_API_BASE || 'https://router.huggingface.co/hf-inference/v1';
+const HF_API_KEY = process.env.HF_API_KEY;
 
-// ----- Timeouts (generous for large models) -----
-const SOCKET_TIMEOUT = 180000;         // 3 minutes (socket keep‑alive)
-const REQUEST_TIMEOUT = 180000;        // 3 minutes per HTTP attempt
-const GLOBAL_TIMEOUT = 900000;         // 15 minutes (all attempts + backoff)
+// Timeouts (generous)
+const SOCKET_TIMEOUT = 90000;          // 90 seconds
+const REQUEST_TIMEOUT = 90000;         // 90 seconds per attempt
+const GLOBAL_TIMEOUT = 600000;         // 10 minutes overall
 
 const httpAgent = new http.Agent({ keepAlive: true, timeout: SOCKET_TIMEOUT });
 const httpsAgent = new https.Agent({ keepAlive: true, timeout: SOCKET_TIMEOUT });
 
-// ----- Model mapping (OpenAI → Nvidia) -----
+// ---------- Model mapping (OpenAI aliases → Hugging Face model IDs) ----------
+// Using the format for Inference Providers
 const MODEL_MAPPING = {
-  'gpt-3.5-turbo': 'deepseek-ai/deepseek-v4-pro',
-  'gpt-4': 'deepseek-ai/deepseek-v4-pro',
-  'gpt-4-turbo': 'deepseek-ai/deepseek-v4-pro'
+  'gpt-3.5-turbo': 'deepseek-ai/DeepSeek-V4-Pro',
+  'gpt-4': 'deepseek-ai/DeepSeek-V4-Pro',
+  'gpt-4-turbo': 'deepseek-ai/DeepSeek-V4-Pro',
 };
 
-// ----- Rate‑limit guard: serial queue + minimum interval -----
-const MIN_REQUEST_INTERVAL_MS = 2000;   // 2 seconds between requests (safe for 40 RPM)
+// ---------- Rate‑limit pacing ----------
+const MIN_REQUEST_INTERVAL_MS = 2000; // 2 seconds to be extra safe
 let lastRequestTime = 0;
 let processingQueue = Promise.resolve();
 
-// ----- Helpers -----
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -45,29 +49,7 @@ function backoff(attempt) {
   return Math.floor(base + jitter);
 }
 
-/** Safely extract an error body from Nvidia, even if it’s a stream or circular */
-function safeErrorBody(data) {
-  if (!data) return '';
-  if (typeof data === 'string') {
-    const snippet = data.substring(0, 500);
-    // Try to extract 'detail' for nicer logging
-    try {
-      const parsed = JSON.parse(data);
-      if (parsed?.detail) return JSON.stringify(parsed.detail).substring(0, 500);
-    } catch {}
-    return snippet;
-  }
-  if (typeof data === 'object') {
-    try {
-      return JSON.stringify(data).substring(0, 500);
-    } catch {
-      return `[Unstringifiable ${typeof data}]`;
-    }
-  }
-  return String(data).substring(0, 500);
-}
-
-// ----- Routes -----
+// ---------- Routes ----------
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.get('/v1/models', (req, res) => {
@@ -77,13 +59,12 @@ app.get('/v1/models', (req, res) => {
       id: model,
       object: 'model',
       created: Date.now(),
-      owned_by: 'nvidia-nim-proxy'
+      owned_by: 'huggingface-proxy'
     }))
   });
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
-  // Disable Express timeouts – we manage them ourselves
   req.setTimeout(0);
   res.setTimeout(0);
 
@@ -96,29 +77,27 @@ app.post('/v1/chat/completions', async (req, res) => {
       if (currentController) {
         currentController.abort();
       }
-      console.log('Client disconnected → aborting Nvidia request');
+      console.log('Client disconnected → aborting HF request');
     }
   });
 
-  // ----- Serial queue + minimum pacing -----
+  // Serial queue + pacing
   processingQueue = processingQueue.then(async () => {
     const now = Date.now();
     const wait = Math.max(0, lastRequestTime + MIN_REQUEST_INTERVAL_MS - now);
     if (wait > 0) {
-      console.log(`Cool-down: waiting ${wait}ms before next request`);
+      console.log(`Pacing: waiting ${wait}ms`);
       await sleep(wait);
     }
     lastRequestTime = Date.now();
 
     try {
       const { model, messages, temperature, max_tokens, stream } = req.body;
-      const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v4-pro';
+      // The model ID is used as-is, without a ':free' suffix, as it's an Inference Provider
+      const hfModel = MODEL_MAPPING[model] || 'deepseek-ai/DeepSeek-V4-Pro';
 
-      // ───────────────────────────────────────────────────
-      //  STREAMING PATH – keep the client alive from the start
-      // ───────────────────────────────────────────────────
+      // ---------- Streaming path: start SSE immediately, keep client alive ----------
       if (stream) {
-        // Open SSE immediately and start a heartbeat
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
@@ -130,42 +109,36 @@ app.post('/v1/chat/completions', async (req, res) => {
           if (!responseClosed) {
             res.write(': waiting-for-model\n\n');
           }
-        }, 15000);   // every 15 seconds, keeps the connection alive
+        }, 15000);
 
         try {
-          const nvidiaStream = await fetchNvidiaStream(
-            nimModel, messages, temperature, max_tokens, responseClosed
-          );
-          // Stop the heartbeat – real data is coming
+          const hfStream = await fetchHFStream(hfModel, messages, temperature, max_tokens, responseClosed);
           clearInterval(heartbeat);
-          // Pipe the real stream
-          nvidiaStream.on('data', chunk => {
+
+          hfStream.on('data', chunk => {
             if (!responseClosed) res.write(chunk);
           });
-          nvidiaStream.on('end', () => {
+          hfStream.on('end', () => {
             if (!responseClosed) res.end();
           });
-          nvidiaStream.on('error', err => {
+          hfStream.on('error', err => {
             console.error('Stream error:', err.message);
             if (!responseClosed) res.end();
           });
         } catch (err) {
           clearInterval(heartbeat);
-          console.error('Nvidia streaming error:', err.message);
+          console.error('HF streaming error:', err.message);
           if (!responseClosed) {
-            // Send an error event inside the SSE stream
             res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
             res.end();
           }
         }
-        return;   // streaming handled, exit the serial queue function
+        return;
       }
 
-      // ───────────────────────────────────────────────────
-      //  NON‑STREAMING PATH
-      // ───────────────────────────────────────────────────
-      const nimRequest = {
-        model: nimModel,
+      // ---------- Non‑streaming path ----------
+      const hfRequest = {
+        model: hfModel,
         messages,
         temperature: temperature ?? 0.7,
         max_tokens: max_tokens ?? 16384,
@@ -187,14 +160,14 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         try {
           currentController = new AbortController();
-          console.log(`Attempt ${attempt}/${MAX_ATTEMPTS} → ${nimModel}`);
+          console.log(`Attempt ${attempt}/${MAX_ATTEMPTS} → ${hfModel}`);
 
           response = await axios.post(
-            `${NIM_API_BASE}/chat/completions`,
-            nimRequest,
+            `${HF_API_BASE}/chat/completions`,
+            hfRequest,
             {
               headers: {
-                Authorization: `Bearer ${NIM_API_KEY}`,
+                Authorization: `Bearer ${HF_API_KEY}`,
                 'Content-Type': 'application/json'
               },
               timeout: REQUEST_TIMEOUT,
@@ -214,50 +187,35 @@ app.post('/v1/chat/completions', async (req, res) => {
 
           const status = error.response?.status;
           const code = error.code;
-          const nvidiaErrorBody = safeErrorBody(error.response?.data);
-          let retryAfterSec = null;
-
-          const retryAfterHeader = error.response?.headers?.['retry-after'];
-          if (retryAfterHeader) {
-            retryAfterSec = parseInt(retryAfterHeader, 10);
-            if (isNaN(retryAfterSec)) retryAfterSec = null;
+          let errorBody = '';
+          if (error.response?.data) {
+            try { errorBody = JSON.stringify(error.response.data).substring(0, 500); } catch {}
           }
 
           console.log(`Attempt ${attempt} failed: HTTP ${status} / code ${code}`);
-          if (nvidiaErrorBody) console.log(`Nvidia error body: ${nvidiaErrorBody}`);
+          if (errorBody) console.log(`HF error body: ${errorBody}`);
 
-          // 429 (rate limit) – retry with Retry-After or backoff
-          if (status === 429) {
-            if (attempt === MAX_ATTEMPTS) break;
-            const delay = (retryAfterSec && retryAfterSec > 0 && retryAfterSec <= 120)
-              ? retryAfterSec * 1000
-              : backoff(attempt);
-            console.log(`Rate limited – waiting ${delay}ms`);
-            await sleep(delay);
-            continue;
-          }
-
-          // Network / server errors – retry
-          if (
+          // Retry only on network errors, rate limits (429), and server errors (5xx)
+          const retryable =
             code === 'ECONNABORTED' ||
             code === 'ERR_CANCELED' ||
-            status === 502 || status === 503 || status === 504
-          ) {
-            if (attempt === MAX_ATTEMPTS) break;
+            status === 429 ||
+            (status && status >= 500);
+
+          if (retryable && attempt < MAX_ATTEMPTS) {
             const delay = backoff(attempt);
-            console.log(`Network/server error, backing off for ${delay}ms`);
+            console.log(`Retrying in ${delay}ms`);
             await sleep(delay);
             continue;
           }
 
-          // Anything else (4xx except 429) → hard error
-          throw new Error(`Nvidia API error: ${status || code} – ${nvidiaErrorBody || error.message}`);
+          // Non‑retryable → throw
+          throw new Error(`HF API error: ${status || code} – ${errorBody}`);
         }
       }
 
       if (!response) throw new Error('Model did not respond after retries');
 
-      // Non‑streaming success
       res.json({
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
@@ -266,6 +224,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         choices: response.data.choices,
         usage: response.data.usage || {}
       });
+
     } catch (error) {
       console.error('Proxy error:', error.message);
       if (!res.headersSent) {
@@ -278,20 +237,15 @@ app.post('/v1/chat/completions', async (req, res) => {
         });
       }
     }
-  }).catch(err => {
-    console.error('Queue processing error:', err);
-  });
+  }).catch(err => console.error('Queue error:', err));
 
-  // Express requires we don’t leave the handler hanging; we always respond inside the chain.
   return new Promise(() => {});
 });
 
-// ─────────────────────────────────────────────────────────
-//  Helper: fetch a STREAMING response from Nvidia with retries
-// ─────────────────────────────────────────────────────────
-async function fetchNvidiaStream(model, messages, temperature, max_tokens, responseClosed) {
-  const nimRequest = {
-    model,
+// ---------- Helper: fetch a Hugging Face streaming response with retries ----------
+async function fetchHFStream(model, messages, temperature, max_tokens, responseClosed) {
+  const hfRequest = {
+    model: model,
     messages,
     temperature: temperature ?? 0.7,
     max_tokens: max_tokens ?? 16384,
@@ -303,19 +257,16 @@ async function fetchNvidiaStream(model, messages, temperature, max_tokens, respo
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     if (responseClosed) throw new Error('Client disconnected');
-
-    if (Date.now() - startTime > GLOBAL_TIMEOUT) {
-      throw new Error('Global timeout reached');
-    }
+    if (Date.now() - startTime > GLOBAL_TIMEOUT) throw new Error('Global timeout reached');
 
     try {
       console.log(`Stream attempt ${attempt}/${MAX_ATTEMPTS} → ${model}`);
       const response = await axios.post(
-        `${NIM_API_BASE}/chat/completions`,
-        nimRequest,
+        `${HF_API_BASE}/chat/completions`,
+        hfRequest,
         {
           headers: {
-            Authorization: `Bearer ${NIM_API_KEY}`,
+            Authorization: `Bearer ${HF_API_KEY}`,
             'Content-Type': 'application/json'
           },
           timeout: REQUEST_TIMEOUT,
@@ -325,35 +276,32 @@ async function fetchNvidiaStream(model, messages, temperature, max_tokens, respo
         }
       );
       console.log(`Stream success on attempt ${attempt}`);
-      return response.data;   // readable stream
+      return response.data;
     } catch (error) {
       const status = error.response?.status;
       const code = error.code;
-      const nvidiaErrorBody = safeErrorBody(error.response?.data);
       console.log(`Stream attempt ${attempt} failed: HTTP ${status} / code ${code}`);
-      if (nvidiaErrorBody) console.log(`Nvidia stream error body: ${nvidiaErrorBody}`);
 
-      // Retry only on temporary failures
       if (
         code === 'ECONNABORTED' ||
         code === 'ERR_CANCELED' ||
         status === 429 ||
-        status === 502 || status === 503 || status === 504
+        (status && status >= 500)
       ) {
-        if (attempt === MAX_ATTEMPTS) break;
-        const delay = backoff(attempt);
-        console.log(`Backing off for ${delay}ms`);
-        await sleep(delay);
-        continue;
+        if (attempt < MAX_ATTEMPTS) {
+          const delay = backoff(attempt);
+          console.log(`Backing off for ${delay}ms`);
+          await sleep(delay);
+          continue;
+        }
       }
-      // Non‑retryable error → throw immediately
-      throw new Error(`Nvidia stream error: ${status || code} – ${nvidiaErrorBody}`);
+      throw new Error(`HF stream error: ${status || code}`);
     }
   }
   throw new Error('Stream did not respond after retries');
 }
 
-// ─────────────────────────────────────────────────────────
+// ---------- 404 fallback ----------
 app.all('*', (req, res) => {
   res.status(404).json({
     error: { message: `Endpoint ${req.path} not found`, type: 'invalid_request_error', code: 404 }
